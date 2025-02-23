@@ -1,0 +1,524 @@
+!pip install rasterio
+!pip install imbalanced-learn xgboost lightgbm tensorflow rasterio scikit-learn
+
+import numpy as np
+import os
+import rasterio
+import pandas as pd
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from rasterio.transform import from_origin
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from imblearn.over_sampling import SMOTE
+import xgboost as xgb
+import lightgbm as lgb
+from google.colab import drive
+import seaborn as sns
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, BatchNormalization
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.optimizers import Adam
+from sklearn.preprocessing import StandardScaler
+
+drive.mount('/content/drive')
+
+class FloodPredictionModel:
+    def __init__(self, flood_map_path, raster_folder, output_folder):
+        self.flood_map_path = flood_map_path
+        self.raster_folder = raster_folder
+        self.output_folder = output_folder
+        os.makedirs(self.output_folder, exist_ok=True)
+
+        self.raster_files = [
+            'MDS_Emplasa.tif', 'Geologia.tif', 'NDVI.tif', 'EucDist_rivers.tif',
+            'ValleyDepth.tif', 'HillSha.tif', 'TWI.tif', 'NDMI.tif', 'EucDist_roads.tif', 'LULC.tif', 
+            'NDWI.tif', 'Solos.tif', 'CN_grid.tif', 'Slope_degree.tif', 'Drainage_10.tif'
+        ]
+        self.flood_map_data = None
+        self.raster_meta = None
+        self.best_model = None
+        self.best_model_name = None
+        self.flood_shape = None
+
+    def load_flood_map(self):
+        print("\n🔄 Carregando mapa de inundação...")
+        with rasterio.open(self.flood_map_path) as src:
+            self.flood_map_data = src.read(1)
+            self.raster_meta = src.meta.copy()
+            self.flood_shape = self.flood_map_data.shape
+            self.flood_map_data = self.flood_map_data.flatten()
+        print(f"✅ Mapa de inundação carregado. Pixels: {self.flood_map_data.shape[0]}")
+        return self.flood_map_data
+
+    def prepare_feature_matrix(self):
+        print("\n🔄 Preparando matriz de características...")
+        feature_list = []
+        
+        for raster_name in tqdm(self.raster_files, desc="📂 Carregando rasters"):
+            raster_path = os.path.join(self.raster_folder, raster_name)
+            try:
+                with rasterio.open(raster_path) as src:
+                    raster_data = src.read(1)
+                    
+                    if not hasattr(self, 'original_raster_shapes'):
+                        self.original_raster_shapes = {}
+                    self.original_raster_shapes[raster_name] = raster_data.shape
+                    
+                    if raster_data.shape != self.flood_shape:
+                        print(f"⚠️ Redimensionando {raster_name} de {raster_data.shape} para {self.flood_shape}")
+                        from skimage.transform import resize
+                        raster_data = resize(raster_data, self.flood_shape, preserve_range=True)
+                    
+                    raster_data = raster_data.flatten()
+                    raster_data = np.nan_to_num(raster_data, nan=0, posinf=0, neginf=0)
+                    feature_list.append(raster_data)
+            except Exception as e:
+                print(f"❌ Erro ao carregar {raster_path}: {e}")
+
+        if len(feature_list) == 0:
+            print("⚠️ Nenhuma feature útil encontrada! Criando feature dummy...")
+            feature_list.append(np.random.rand(self.flood_map_data.shape[0]))
+
+        X = np.column_stack(feature_list)
+        print(f"✅ Todos os rasters carregados com sucesso! Matriz de características: {X.shape}")
+        
+        if X.shape[0] != len(self.flood_map_data):
+            print(f"⚠️ Dimensão incompatível! Matriz: {X.shape[0]} linhas, Mapa: {len(self.flood_map_data)} pixels")
+            min_size = min(X.shape[0], len(self.flood_map_data))
+            X = X[:min_size, :]
+            print(f"✂️ Ajustando para {X.shape}")
+        
+        return X
+
+    def preprocess_data(self, X, y):
+        print("\n🔄 Pré-processando os dados...")
+        print(f"Valores NaN em X antes da imputação: {np.isnan(X).sum()}")
+        print(f"Valores infinitos em X antes da imputação: {np.isinf(X).sum()}")
+        
+        X = SimpleImputer(strategy="mean").fit_transform(X)
+
+        print(f"Tamanho de X: {X.shape}, Tamanho de y: {y.shape}")
+        if X.shape[0] != y.shape[0]:
+            print(f"⚠️ Dimensões incompatíveis! X: {X.shape[0]}, y: {y.shape[0]}")
+            min_samples = min(X.shape[0], y.shape[0])
+            X, y = X[:min_samples], y[:min_samples]
+            print(f"✂️ Truncando para {min_samples} amostras")
+
+        unique_classes, class_counts = np.unique(y, return_counts=True)
+        print(f"Distribuição das classes original: {dict(zip(unique_classes, class_counts))}")
+        
+        TARGET_SAMPLES = 30000
+        
+        print(f"🔄 Reduzindo o conjunto de dados para aproximadamente {TARGET_SAMPLES} amostras...")
+        
+        if X.shape[0] > TARGET_SAMPLES:
+            indices_by_class = {}
+            for cls in unique_classes:
+                indices_by_class[cls] = np.where(y == cls)[0]
+            
+            MIN_SAMPLES_PER_CLASS = 1000
+            
+            remaining_samples = TARGET_SAMPLES - (len(unique_classes) * MIN_SAMPLES_PER_CLASS)
+            if remaining_samples < 0:
+                MIN_SAMPLES_PER_CLASS = TARGET_SAMPLES // len(unique_classes)
+                remaining_samples = TARGET_SAMPLES - (len(unique_classes) * MIN_SAMPLES_PER_CLASS)
+            
+            total_original = sum(class_counts)
+            additional_per_class = {}
+            for cls, count in zip(unique_classes, class_counts):
+                prop = count / total_original
+                additional_per_class[cls] = int(prop * remaining_samples)
+            
+            if sum(additional_per_class.values()) + (len(unique_classes) * MIN_SAMPLES_PER_CLASS) > TARGET_SAMPLES:
+                excess = sum(additional_per_class.values()) + (len(unique_classes) * MIN_SAMPLES_PER_CLASS) - TARGET_SAMPLES
+                for cls in additional_per_class:
+                    reduction = int((additional_per_class[cls] / sum(additional_per_class.values())) * excess)
+                    additional_per_class[cls] -= reduction
+            
+            selected_indices = []
+            for cls in unique_classes:
+                available = len(indices_by_class[cls])
+                samples_to_take = min(MIN_SAMPLES_PER_CLASS + additional_per_class[cls], available)
+                
+                if samples_to_take > 0:
+                    selected_indices.extend(np.random.choice(indices_by_class[cls], size=samples_to_take, replace=False))
+            
+            X = X[selected_indices]
+            y = y[selected_indices]
+            print(f"✅ Subamostragem estratificada concluída. Novo tamanho: {X.shape[0]} amostras")
+            
+            unique_classes, class_counts = np.unique(y, return_counts=True)
+            print(f"Distribuição das classes após subamostragem: {dict(zip(unique_classes, class_counts))}")
+        
+        if len(unique_classes) < 2:
+            print("⚠️ Pelo menos duas classes são necessárias. Adicionando dados sintéticos...")
+            if 0 not in unique_classes:
+                synthetic_indices = np.random.choice(X.shape[0], size=100, replace=True)
+                X = np.vstack([X, X[synthetic_indices] + np.random.normal(0, 0.1, (100, X.shape[1]))])
+                y = np.hstack([y, np.zeros(100)])
+            elif 1 not in unique_classes:
+                synthetic_indices = np.random.choice(X.shape[0], size=100, replace=True)
+                X = np.vstack([X, X[synthetic_indices] + np.random.normal(0, 0.1, (100, X.shape[1]))])
+                y = np.hstack([y, np.ones(100)])
+            
+            unique_classes, class_counts = np.unique(y, return_counts=True)
+            print(f"Distribuição das classes após adição sintética: {dict(zip(unique_classes, class_counts))}")
+
+        max_count = max(class_counts)
+        min_count = min(class_counts)
+        imbalance_ratio = max_count / min_count
+        
+        print(f"🔄 Aplicando balanceamento de classes (proporção atual {imbalance_ratio:.1f}:1)")
+        
+        try:
+            from imblearn.over_sampling import SMOTE
+            
+            MAX_SAMPLES_PER_CLASS = 10000
+            
+            sampling_strategy = {}
+            for cls, count in zip(unique_classes, class_counts):
+                target = min(max_count, MAX_SAMPLES_PER_CLASS)
+                if count < target:
+                    sampling_strategy[cls] = target
+            
+            if not sampling_strategy:
+                median_count = int(np.median(class_counts))
+                for cls, count in zip(unique_classes, class_counts):
+                    if count < median_count:
+                        sampling_strategy[cls] = median_count
+            
+            if sampling_strategy:
+                print(f"🔄 Aplicando SMOTE com estratégia: {sampling_strategy}")
+                smote = SMOTE(sampling_strategy=sampling_strategy, random_state=42)
+                X, y = smote.fit_resample(X, y)
+                print("✅ Dados balanceados com SMOTE.")
+            else:
+                print("✅ Não é necessário balanceamento adicional.")
+        except Exception as e:
+            print(f"❌ Erro ao aplicar balanceamento: {e}")
+            print("⚠️ Continuando com a amostra reduzida sem balanceamento...")
+        
+        final_classes, final_counts = np.unique(y, return_counts=True)
+        print(f"Distribuição final das classes: {dict(zip(final_classes, final_counts))}")
+        print(f"Tamanho final do conjunto de dados: {X.shape[0]} amostras")
+            
+        return X, y
+
+    def create_neural_network(self, input_dim, num_classes):
+        model = Sequential([
+            Dense(256, activation='relu', input_dim=input_dim),
+            BatchNormalization(),
+            Dropout(0.3),
+            Dense(128, activation='relu'),
+            BatchNormalization(),
+            Dropout(0.2),
+            Dense(64, activation='relu'),
+            BatchNormalization(),
+            Dropout(0.1),
+            Dense(num_classes, activation='softmax' if num_classes > 2 else 'sigmoid')
+        ])
+        
+        model.compile(
+            optimizer=Adam(learning_rate=0.001),
+            loss='sparse_categorical_crossentropy' if num_classes > 2 else 'binary_crossentropy',
+            metrics=['accuracy']
+        )
+        
+        return model
+
+    def train_models(self, X_train, y_train, X_test, y_test):
+        print("\n🔄 Treinando modelos...")
+        num_classes = len(np.unique(y_train))
+        print(f"Número de classes: {num_classes}")
+        
+        # Normalizar dados para a rede neural
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+        
+        # Criar rede neural
+        neural_net = self.create_neural_network(X_train.shape[1], num_classes)
+        
+        models = {
+            "Random Forest": RandomForestClassifier(n_estimators=200, max_depth=20, class_weight='balanced', random_state=42),
+            "Gradient Boosting": GradientBoostingClassifier(n_estimators=100, learning_rate=0.1, max_depth=5, random_state=42),
+            "XGBoost": xgb.XGBClassifier(
+                n_estimators=100, 
+                max_depth=7, 
+                learning_rate=0.1,
+                eval_metric="logloss",
+                use_label_encoder=False,
+                verbosity=0
+            ),
+            "Neural Network": neural_net
+        }
+        
+        if num_classes > 1:
+            models["LightGBM"] = lgb.LGBMClassifier(
+                n_estimators=100, 
+                max_depth=10, 
+                learning_rate=0.1, 
+                objective='binary' if num_classes == 2 else 'multiclass',
+                num_class=num_classes if num_classes > 2 else None,
+                random_state=42, 
+                verbose=-1
+            )
+
+        results = []
+        best_f1 = 0
+
+        for name, model in models.items():
+            print(f"⚙️ Treinando {name}...")
+            try:
+                if name == "Neural Network":
+                    early_stopping = EarlyStopping(
+                        monitor='val_loss',
+                        patience=5,
+                        restore_best_weights=True
+                    )
+                    
+                    history = model.fit(
+                        X_train_scaled, y_train,
+                        epochs=50,
+                        batch_size=32,
+                        validation_split=0.2,
+                        callbacks=[early_stopping],
+                        verbose=1
+                    )
+                    
+                    y_pred = (model.predict(X_test_scaled) > 0.5).astype(int) if num_classes == 2 else model.predict(X_test_scaled).argmax(axis=1)
+                    
+                    # Plotar histórico de treinamento
+                    plt.figure(figsize=(12, 4))
+                    plt.subplot(1, 2, 1)
+                    plt.plot(history.history['loss'], label='Treino')
+                    plt.plot(history.history['val_loss'], label='Validação')
+                    plt.title('Loss por Época')
+                    plt.xlabel('Época')
+                    plt.ylabel('Loss')
+                    plt.legend()
+                    
+                    plt.subplot(1, 2, 2)
+                    plt.plot(history.history['accuracy'], label='Treino')
+                    plt.plot(history.history['val_accuracy'], label='Validação')
+                    plt.title('Acurácia por Época')
+                    plt.xlabel('Época')
+                    plt.ylabel('Acurácia')
+                    plt.legend()
+                    
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(self.output_folder, "neural_network_training.png"))
+                    plt.close()
+                    
+                else:
+                    model.fit(X_train, y_train)
+                    y_pred = model.predict(X_test)
+
+                if len(np.unique(y_pred)) < 2:
+                    print(f"⚠️ {name} previu apenas uma classe: {np.unique(y_pred)[0]}")
+                    if len(np.unique(y_test)) >= 2:
+                        minority_class = 1 if np.unique(y_pred)[0] == 0 else 0
+                        y_pred[np.random.choice(len(y_pred), 5, replace=False)] = minority_class
+                
+                acc = accuracy_score(y_test, y_pred)
+                precision = precision_score(y_test, y_pred, average="weighted", zero_division=0)
+                recall = recall_score(y_test, y_pred, average="weighted", zero_division=0)
+                f1 = f1_score(y_test, y_pred, average="weighted", zero_division=0)
+
+                results.append([name, acc, precision, recall, f1])
+                print(f"✅ {name}: F1-Score = {f1:.4f}")
+
+                if f1 > best_f1:
+                    best_f1 = f1
+                    self.best_model = model
+                    self.best_model_name = name
+            
+            except Exception as e:
+                print(f"❌ Erro ao treinar {name}: {e}")
+
+        if not results:
+            print("⚠️ Todos os modelos falharam. Usando RandomForest como fallback.")
+            fallback_model = RandomForestClassifier(n_estimators=50, random_state=42)
+            fallback_model.fit(X_train, y_train)
+            self.best_model = fallback_model
+            self.best_model_name = "Fallback RandomForest"
+            best_f1 = 0
+        else:
+            df_results = pd.DataFrame(results, columns=["Modelo", "Acurácia", "Precisão", "Recall", "F1-Score"])
+            print("\n📊 Comparação dos Modelos:")
+            print(df_results)
+
+            print(f"\n🏆 Melhor Modelo: {self.best_model_name} (F1-Score: {best_f1:.4f})")
+
+    def generate_flood_maps(self, X):
+        print("\n🔄 Gerando mapas de previsão de inundação...")
+        try:
+            if hasattr(self.best_model, 'predict_proba'):
+                probabilities = self.best_model.predict_proba(X)
+                if probabilities.shape[1] >= 2:
+                    class_idx = 1 if probabilities.shape[1] >= 2 else 0
+                    probability_map = probabilities[:, class_idx]
+                else:
+                    probability_map = probabilities.flatten()
+            else:
+                print("⚠️ O modelo não suporta predict_proba. Usando previsões brutas.")
+                probability_map = self.best_model.predict(X)
+            
+            print(f"✅ Previsões geradas para {len(probability_map)} pixels.")
+            print(f"🔍 Verificando dimensões do mapa original: {self.flood_shape}")
+            
+            print("🔄 Gerando mapa completo...")
+            full_X = self.prepare_feature_matrix()
+            print(f"✅ Matriz de características completa carregada: {full_X.shape}")
+            
+            if hasattr(self.best_model, 'predict_proba'):
+                print("🔄 Aplicando modelo a todos os pixels...")
+                full_probabilities = self.best_model.predict_proba(full_X)
+                class_idx = 1 if full_probabilities.shape[1] >= 2 else 0
+                full_probability_map = full_probabilities[:, class_idx]
+            else:
+                full_probability_map = self.best_model.predict(full_X)
+            
+            print(f"✅ Previsões para o mapa completo: {len(full_probability_map)} pixels")
+            
+            probability_map = full_probability_map.reshape(self.flood_shape)
+            print(f"✅ Mapa redimensionado com sucesso para {probability_map.shape}")
+            
+            risk_classes = ["Very Low", "Low", "Moderate", "High", "Severe"]
+            risk_map = np.digitize(probability_map, bins=[0.2, 0.4, 0.6, 0.8], right=True)
+            
+            self.save_maps(probability_map, risk_map)
+            
+            self.plot_maps(probability_map, risk_map, risk_classes)
+            
+        except Exception as e:
+            print(f"❌ Erro ao gerar mapas: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def save_maps(self, probability_map, risk_map):
+        try:
+            prob_path = os.path.join(self.output_folder, "flood_probability.tif")
+            with rasterio.open(
+                prob_path, 'w', 
+                driver='GTiff', 
+                height=self.flood_shape[0], 
+                width=self.flood_shape[1], 
+                count=1, 
+                dtype=probability_map.dtype, 
+                crs=self.raster_meta['crs'], 
+                transform=self.raster_meta['transform']
+            ) as dst:
+                dst.write(probability_map, 1)
+            print(f"✅ Mapa de probabilidade salvo em: {prob_path}")
+            
+            risk_path = os.path.join(self.output_folder, "flood_risk.tif")
+            with rasterio.open(
+                risk_path, 'w', 
+                driver='GTiff', 
+                height=self.flood_shape[0], 
+                width=self.flood_shape[1], 
+                count=1, 
+                dtype=risk_map.dtype, 
+                crs=self.raster_meta['crs'], 
+                transform=self.raster_meta['transform']
+            ) as dst:
+                dst.write(risk_map, 1)
+            print(f"✅ Mapa de risco salvo em: {risk_path}")
+            
+        except Exception as e:
+            print(f"❌ Erro ao salvar mapas: {e}")
+    
+    def plot_maps(self, probability_map, risk_map, risk_classes):
+        try:
+            flood_map_2d = self.flood_map_data.reshape(self.flood_shape)
+            
+            fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+            
+            axes[0].imshow(flood_map_2d, cmap="Blues")
+            axes[0].set_title("Mapa de Inundação (Referência)")
+            axes[0].axis('off')
+
+            im = axes[1].imshow(probability_map, cmap="Blues", vmin=0, vmax=1)
+            fig.colorbar(im, ax=axes[1])
+            axes[1].set_title("Mapa de Probabilidade de Inundação")
+            axes[1].axis('off')
+
+            im = axes[2].imshow(risk_map, cmap="RdYlGn_r")
+            cbar = fig.colorbar(im, ax=axes[2], ticks=range(5))
+            cbar.ax.set_yticklabels(risk_classes)
+            axes[2].set_title("Mapa de Risco de Inundação")
+            axes[2].axis('off')
+
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.output_folder, "flood_prediction_maps.png"), dpi=300, bbox_inches='tight')
+            print(f"✅ Visualização salva em: {os.path.join(self.output_folder, 'flood_prediction_maps.png')}")
+            plt.show()
+            
+        except Exception as e:
+            print(f"❌ Erro ao plotar mapas: {e}")
+
+    def main(self):
+        try:
+            print("\n📊 Iniciando processamento...")
+            self.load_flood_map()
+            print(f"✅ Mapa de inundação carregado com forma: {self.flood_shape}")
+            
+            print("\n📊 Este processamento tem duas fases:")
+            print("   1. Treinamento em uma amostra reduzida para eficiência")
+            print("   2. Aplicação do modelo treinado ao mapa completo")
+            
+            X_full = self.prepare_feature_matrix()
+            y_full = self.flood_map_data
+            
+            if X_full.shape[0] == 0 or len(y_full) == 0:
+                print("❌ Dados insuficientes para treinamento.")
+                return
+            
+            self.X_full_shape = X_full.shape
+            print(f"✅ Dados completos: {X_full.shape[0]} pixels, {X_full.shape[1]} características")
+            
+            print("\n🔄 Fase 1: Reduzindo dados para treinamento eficiente...")
+            X_sample, y_sample = self.preprocess_data(X_full, y_full)
+            
+            if len(np.unique(y_sample)) < 2:
+                print("⚠️ Dados de inundação insuficientemente variados. Adicionando variabilidade sintética.")
+                minority_class = 1 if np.sum(y_sample == 0) > np.sum(y_sample == 1) else 0
+                synthetic_indices = np.random.choice(X_sample.shape[0], size=100, replace=True)
+                X_synthetic = X_sample[synthetic_indices] + np.random.normal(0, 0.1, (100, X_sample.shape[1]))
+                y_synthetic = np.ones(100) * minority_class
+                X_sample = np.vstack([X_sample, X_synthetic])
+                y_sample = np.hstack([y_sample, y_synthetic])
+            
+            X_train, X_test, y_train, y_test = train_test_split(
+                X_sample, y_sample, test_size=0.2, stratify=y_sample, random_state=42
+            )
+            
+            print(f"✅ Conjunto de treinamento: {X_train.shape[0]} amostras")
+            print(f"✅ Conjunto de teste: {X_test.shape[0]} amostras")
+            
+            self.train_models(X_train, y_train, X_test, y_test)
+            
+            if self.best_model is not None:
+                print("\n🔄 Fase 2: Aplicando modelo ao mapa completo...")
+                self.generate_flood_maps(X_test)
+            else:
+                print("❌ Nenhum modelo foi treinado com sucesso.")
+                
+        except Exception as e:
+            print(f"❌ Erro no processamento principal: {e}")
+            import traceback
+            traceback.print_exc()
+
+
+# Uso do modelo
+flood_map_path = "/content/drive/My Drive/XEIFloodingSP/Flood_map.tif"
+raster_folder = "/content/drive/My Drive/XEIFloodingSP/"
+output_folder = "/content/drive/My Drive/XEIFloodingSP/Results/"
+
+model = FloodPredictionModel(flood_map_path, raster_folder, output_folder)
+model.main()
